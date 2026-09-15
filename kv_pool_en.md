@@ -1,0 +1,1284 @@
+# KV Cache Pool (Ascend Store)
+
+## Feature Introduction (Required)
+
+**This content needs to be supplemented. The following content is inferred based on the original context, please confirm manually.** KV Cache Pool (Ascend Store) is a cross-node KV Cache pooling storage feature provided by vLLM-Ascend. It writes KV Cache to external storage backends (Mooncake / Memcache / Yuanrong) via `AscendStoreConnector`, and works with the PD (Prefill/Decode) disaggregation architecture to share and reuse KV Cache across multiple vLLM instances, avoiding redundant recomputation of identical prefixes.
+
+**This content needs to be supplemented. The following content is inferred based on the original context, please confirm manually.** Key benefits include: memory decoupling between Prefill and Decode nodes in PD disaggregation deployments with independent scaling; cross-request/cross-node KV reuse reducing redundant Prefill computation; SSD Offload support for extended KV capacity; and transfer QoS priority control.
+
+**This content needs to be supplemented. The following content is inferred based on the original context, please confirm manually.** Requires vLLM main branch and vLLM-Ascend main branch, mooncake >= 0.3.11.post1, CANN >= 8.5.0, supported since the aforementioned versions.
+
+**Reorganized based on the original context, please verify manually.**
+
+| Backend | Core Capabilities |
+| :--- | :--- |
+| Mooncake | Mooncake is the serving platform for Kimi, a leading LLM service provided by Moonshot AI. Supports SSD Offload, multi-tenant quota management, covering A2/A3/Ascend 950 Products series. |
+| Memcache | Based on MemFabric, supports A3 HCCS high-speed interconnect, separated deployment, SSD Cache; `use_layerwise` per-layer KV access is only supported on the Memcache backend (Prefill node). |
+| Yuanrong | Based on openyuanrong-datasystem, supports Coordinator/etcd service discovery, Remote H2D transfer, multi-node deployment. |
+
+### Usage Scenarios (Required)
+
+**This content needs to be supplemented. The following content is inferred based on the original context, please confirm manually.**
+
+| Scenario | Distinction Basis | Applicable Conditions | Boundaries |
+| :--- | :--- | :--- | :--- |
+| Mooncake backend + PD disaggregation | Cross-node KV sharing needed, Prefill/Decode on separate nodes | A2/A3/Ascend 950 Products, ROCE/HCCS interconnect | All nodes must sync `PYTHONHASHSEED`; Store/PD traffic separation requires CANN >= 9.1.0 |
+| Mooncake backend + PD-Mixed | Single-node P/D mixed deployment, no proxy needed | Single node, `kv_role=kv_both` | Requests go directly to the mixed deployment script port |
+| MooncakeStore SSD Offload | KV offload to SSD for extended capacity | `enable_ssd_offload=true`, Embedded Real Client mode | Must align to 1 GB; `ssd_offload_path` must be absolute; must explicitly set `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` |
+| Memcache backend | A3 HCCS high-speed interconnect or layerwise access needed | A2/A3/Ascend 950 Products; `use_layerwise` only on Prefill node | Separated deployment mode currently only supports A3 HCCS |
+| Yuanrong backend | Multi-node deployment or Remote H2D transfer needed | openyuanrong-datasystem installed, Coordinator or etcd service discovery | Worker address cannot use `127.0.0.1`/`0.0.0.0` in multi-node; cannot configure both discovery backends on the same Worker |
+
+### Constraints and Limitations (Required)
+
+**This content needs to be supplemented. The following content is inferred based on the original context, please confirm manually.**
+
+| Dimension | Constraints |
+| :--- | :--- |
+| Hardware | A2 (800I/800T A2): HDK >= 25.5 recommended, ROCE direct transfer needs `HCCL_INTRA_ROCE_ENABLE=1`. A3 (800I/800T A3): HDK >= 26.0 (or HDK >= 25.5 with mooncake >= v0.3.11), CANN >= 9.0.0, LingQu Computing Network >= 1.5. Ascend 950 Products (950PR/950DT): HDK >= 25.6 with mooncake >= v0.3.11, CANN >= 9.1.0, requires extra mounts `/dev/ummu`, `/dev/uburma`, `/usr/bin/urma_admin`, `/lib/route.conf`, `/etc/hccl_rootinfo.json`. Mooncake wheel requires glibc >= 2.35. |
+| Deployment | `hccn.conf` must exist in the environment; mount into container when using Docker. Store/PD traffic separation requires CANN >= 9.1.0, for A3 and Ascend 950 Products. Memcache separated deployment currently only supports A3 HCCS. |
+| Engine | Requires vLLM main branch and vLLM-Ascend main branch. |
+| Model | `kv_load_failure_policy=recompute` does not yet support hybrid attention models (e.g., DeepSeekV4, Qwen 3.5). MLA models can use `consumer_is_to_put` for Decode node to store KV for Prefill node. |
+| Feature Mutex | `use_layerwise` only supported on Prefill node with Memcache backend. Yuanrong Worker cannot configure both Coordinator and etcd discovery backends simultaneously. Under `P2P_TRANSFER` or FabricMem mode, client-side device memory pre-registration is always skipped regardless of `enable_dev_mem_pregister` value. |
+| Software Dependencies | CANN >= 8.5.0; mooncake >= 0.3.11.post1 (non-default tenant requires >= 0.3.12); Memcache requires `memfabric-hybrid` and `memcache-hybrid` (SSD Cache needs `memcache_hybrid >= 1.2.0`); Yuanrong requires `openyuanrong-datasystem`. |
+| Other Restrictions | All nodes must sync `PYTHONHASHSEED`. `ssd_offload_path` must be an absolute path; relative paths, symlinks, and paths containing `..` are rejected. Devices specified by `ubsio.disk.path` must be dedicated with no mount points. In multi-node Yuanrong deployments, Worker addresses cannot be `127.0.0.1`/`0.0.0.0`. `tenant_id` is not an authentication mechanism. |
+| Scheme Constraints | On A3 with `ASCEND_ENABLE_USE_FABRIC_MEM=1`, fabric mem allocations must be integer multiples of 1 GB. `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` must be explicitly set to match actual disk capacity. For Memcache separated deployment, `ock.mmc.local_service.max.dram.size` must accommodate the maximum `dram.size` across all LocalService processes. |
+
+## Feature Usage (Required)
+
+### Environment Preparation (Optional)
+
+**Reorganized based on the original context, please verify manually.**
+
+1. Verify that `hccn.conf` exists in the environment. When using Docker, mount it into the container:
+   ```bash
+   cat /etc/hccn.conf
+   ```
+2. For Ascend 950 Products, additionally mount `/dev/ummu`, `/dev/uburma`, `/usr/bin/urma_admin`, `/lib/route.conf`, `/etc/hccl_rootinfo.json`.
+3. Synchronize `PYTHONHASHSEED` across all nodes:
+   ```bash
+   export PYTHONHASHSEED=0
+   ```
+4. Install software for the selected backend (see installation steps in each scenario).
+
+> Note: Memcache-specific prerequisite checks (memory scan, Ascend 950 Products signature verification disabling and container mounts, SSD disk status checks) are part of the scenario steps — see "Scenario 2: Memcache Backend Step 1".
+
+### Usage Examples (Required)
+
+**Reorganized based on the original context, please verify manually.**
+
+#### Scenario 1: Mooncake Backend
+
+##### Step 1: Software Installation
+
+Check the Mooncake wheel dependency:
+
+```shell
+ldd --version
+```
+
+glibc must be >= 2.35.
+
+Install Mooncake:
+
+```shell
+python3 -m pip install mooncake-transfer-engine-npu==0.3.11.post1 --extra-index-url https://mirrors.aliyun.com/pypi/web/simple
+```
+
+Mooncake `0.3.11.post1` remains supported when `tenant_id` is omitted or resolves to `default`. A non-default tenant requires Mooncake `0.3.12` or later.
+
+##### Step 2: Configure mooncake.json and Start mooncake_master
+
+Configure `mooncake.json` and point `MOONCAKE_CONFIG_PATH` to its full path:
+
+```json
+{
+    "metadata_server": "P2PHANDSHAKE",
+    "protocol": "ascend",
+    "device_name": "",
+    "master_server_address": "xx.xx.xx.xx:50088",
+    "global_segment_size": "1GB",
+    "preferred_segment": false,
+    "prefer_alloc_in_same_node": true,
+    "enable_ssd_offload": false,
+    "ssd_offload_path": "/nvme/mooncake_offload",
+    "tenant_id": "default"
+}
+```
+
+Start `mooncake_master` (only needs to run on one node):
+
+```shell
+mooncake_master --port 50088 --eviction_high_watermark_ratio 0.9 --eviction_ratio 0.1 --default_kv_lease_ttl 11000 --enable_offload=false --client_ttl=120
+```
+
+To enable strict multi-tenant isolation, start with:
+
+```shell
+mooncake_master \
+    --port 50088 \
+    --enable_multi_tenants=true \
+    --tenant_quota_connector_type=file \
+    --tenant_quota_connector_uri=/etc/mooncake/tenant_quotas.yaml
+```
+
+Example tenant quota file (`/etc/mooncake/tenant_quotas.yaml`):
+
+```yaml
+version: 1
+
+tenants:
+  - name: tenant-a
+    quota: 200GB
+  - name: tenant-b
+    quota: 200GB
+  - name: default
+    quota: 100GB
+```
+
+##### Step 3: PD Disaggregation Scenario
+
+**run_prefill.sh / run_decode.sh:**
+
+```shell
+#!/bin/bash
+
+# prefill / decode
+ROLE="prefill"
+# A2 (800I/800T A2) or A3 (800I/800T A3) or A5 (950PR/950DT)
+HARDWARE_SERIES="A2"
+# Link type: ROCE or HCCS in A3 series.
+LINK_TYPE="ROCE"
+LOCAL_IP="xx.xx.xx.xx"
+NIC_NAME="xxxxxx"
+
+MODEL_PATH="xxxxxxx/Qwen3-32B"
+SERVED_MODEL_NAME="qwen3"
+DATA_PARALLEL_SIZE=1
+TENSOR_PARALLEL_SIZE=8
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+# parameters required for kv pool and mooncake
+export PYTHONHASHSEED=0
+export MOONCAKE_CONFIG_PATH="/xxxxxx/mooncake.json"
+export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages/mooncake:$LD_LIBRARY_PATH
+
+if [ "$ROLE" == "prefill" ]; then
+    KV_ROLE="kv_producer"
+    KV_PORT="20001"
+    LOOKUP_RPC_PORT="0"
+    API_PORT="8100"
+else
+    KV_ROLE="kv_consumer"
+    KV_PORT="20002"
+    LOOKUP_RPC_PORT="1"
+    API_PORT="8200"
+fi
+
+echo "Starting vLLM on Series: $HARDWARE_SERIES, Role: $ROLE"
+
+rm -rf /root/ascend/log/*
+rm -rf ./connector.log
+
+# See Configuration Parameters section for detailed parameter descriptions
+if [ "$HARDWARE_SERIES" == "A2" ] || { [ "$HARDWARE_SERIES" == "A3" ] && [ "$LINK_TYPE" == "ROCE" ]; }; then
+    echo 200000 > /proc/sys/vm/nr_hugepages
+    export HCCL_IF_IP=$LOCAL_IP
+    export GLOO_SOCKET_IFNAME=$NIC_NAME
+    export TP_SOCKET_IFNAME=$NIC_NAME
+    export HCCL_SOCKET_IFNAME=$NIC_NAME
+    export HCCL_INTRA_ROCE_ENABLE=1
+
+elif [ "$HARDWARE_SERIES" == "A3" ] && [ "$LINK_TYPE" == "HCCS" ]; then
+    export ACL_OP_INIT_MODE=1
+    export ASCEND_ENABLE_USE_FABRIC_MEM=1
+elif [ "$HARDWARE_SERIES" == "A5" ]; then
+    # A5 UBOE
+    export ASCEND_GLOBAL_RESOURCE_CONFIG='{"comm_resource_config.protocol_desc":["uboe:device"]}'
+    # A5 UB
+    export ASCEND_LOCAL_COMM_RES='{"version":"1.3"}'
+else
+    echo "Error: Invalid HARDWARE_SERIES. Set to 'A2', 'A3', or 'A5'."
+    exit 1
+fi
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+KV_CONFIG='{
+  "kv_connector": "MultiConnector",
+  "kv_role": "'$KV_ROLE'",
+  "kv_connector_extra_config": {
+    "connectors": [
+      {
+        "kv_connector": "MooncakeConnectorV1",
+        "kv_role": "'$KV_ROLE'",
+        "kv_port": "'$KV_PORT'",
+        "kv_connector_extra_config": {
+          "prefill": {
+            "dp_size": '$DATA_PARALLEL_SIZE',
+            "tp_size": '$TENSOR_PARALLEL_SIZE'
+          },
+          "decode": {
+            "dp_size": '$DATA_PARALLEL_SIZE',
+            "tp_size": '$TENSOR_PARALLEL_SIZE'
+          }
+        }
+      },
+      {
+        "kv_connector": "AscendStoreConnector",
+        "kv_role": "'$KV_ROLE'",
+        "kv_connector_extra_config": {
+          "backend": "mooncake",
+          "lookup_rpc_port": "'$LOOKUP_RPC_PORT'"
+        }
+      }
+    ]
+  }
+}'
+
+CMD_ARGS=(
+  --model "$MODEL_PATH"
+  --served-model-name "$SERVED_MODEL_NAME"
+  --trust-remote-code
+  --enforce-eager
+  --data-parallel-size "$DATA_PARALLEL_SIZE"
+  --tensor-parallel-size "$TENSOR_PARALLEL_SIZE"
+  --port "$API_PORT"
+  --max-num-seqs 20
+  --max-model-len 32768
+  --max-num-batched-tokens 16384
+  --gpu-memory-utilization 0.9
+  --kv-transfer-config "$KV_CONFIG"
+)
+
+python -m vllm.entrypoints.openai.api_server "${CMD_ARGS[@]}" > log_${ROLE}.log 2>&1
+
+echo "vLLM started. Log file: log_${ROLE}.log"
+```
+
+Start the proxy_server (connecting Prefill and Decode nodes):
+
+```shell
+python vllm-ascend/examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py \
+    --host localhost \
+    --prefiller-hosts localhost \
+    --prefiller-ports 8100 \
+    --decoder-hosts localhost \
+    --decoder-ports 8200
+```
+
+Replace localhost with the actual IP address.
+
+Run inference:
+
+Short question:
+
+```shell
+curl -s http://localhost:8000/v1/completions -H "Content-Type: application/json" -d '{ "model": "qwen3", "prompt": "Hello. I have a question. The president of the United States is", "max_completion_tokens": 200, "temperature":0.0 }'
+```
+
+Long question:
+
+```shell
+curl -s http://localhost:8000/v1/completions -H "Content-Type: application/json" -d '{ "model": "qwen3", "prompt": "Given the accelerating impacts of climate change\u2014including rising sea levels, increasing frequency of extreme weather events, loss of biodiversity, and adverse effects on agriculture and human health\u2014there is an urgent need for a robust, globally coordinated response. However, international efforts are complicated by a range of factors: economic disparities between high-income and low-income countries, differing levels of industrialization, varying access to clean energy technologies, and divergent political systems that influence climate policy implementation. In this context, how can global agreements like the Paris Accord be redesigned or strengthened to not only encourage but effectively enforce emission reduction targets? Furthermore, what mechanisms can be introduced to promote fair and transparent technology transfer, provide adequate financial support for climate adaptation in vulnerable regions, and hold nations accountable without exacerbating existing geopolitical tensions or disproportionately burdening those with historically lower emissions?", "max_completion_tokens": 256, "temperature":0.0 }'
+```
+
+To enable Decode node KV Cache storage for Prefill use with MLA models, add `consumer_is_to_put: true` to `AscendStoreConnector`; if Prefill enables PP, also set `prefill_pp_size` or `prefill_pp_layer_partition`:
+
+```json
+{
+    "kv_connector": "AscendStoreConnector",
+    "kv_role": "kv_consumer",
+    "kv_load_failure_policy": "recompute",
+    "kv_connector_extra_config": {
+        "lookup_rpc_port": "0",
+        "backend": "mooncake",
+        "consumer_is_to_put": true,
+        "prefill_pp_size": 2,
+        "prefill_pp_layer_partition": "30,31"
+    }
+}
+```
+
+Expected output: Returns a JSON response conforming to the OpenAI Completions API specification, containing `id`, `choices` (with `text` and `finish_reason`), `usage`, and other fields.
+
+##### Step 4: PD-Mixed Scenario
+
+**pd_mix.sh:**
+
+```shell
+#!/bin/bash
+
+# A2 (800I/800T A2) or A3 (800I/800T A3) or A5 (950PR/950DT)
+HARDWARE_SERIES="A2"
+# Link type: ROCE or HCCS in A3 series.
+LINK_TYPE="ROCE"
+LOCAL_IP="xx.xx.xx.xx"
+NIC_NAME="xxxxxx"
+
+MODEL_PATH="xxxxxxx/Qwen3-32B"
+SERVED_MODEL_NAME="qwen3"
+DATA_PARALLEL_SIZE=1
+TENSOR_PARALLEL_SIZE=8
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+# parameters required for kv pool and mooncake
+export PYTHONHASHSEED=0
+export MOONCAKE_CONFIG_PATH="/xxxxxx/mooncake.json"
+export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages/mooncake:$LD_LIBRARY_PATH
+
+echo "Starting vLLM on Series: $HARDWARE_SERIES"
+
+rm -rf /root/ascend/log/*
+rm -rf ./connector.log
+
+# See Configuration Parameters section for detailed parameter descriptions
+if [ "$HARDWARE_SERIES" == "A2" ] || { [ "$HARDWARE_SERIES" == "A3" ] && [ "$LINK_TYPE" == "ROCE" ]; }; then
+    echo 200000 > /proc/sys/vm/nr_hugepages
+    export HCCL_IF_IP=$LOCAL_IP
+    export GLOO_SOCKET_IFNAME=$NIC_NAME
+    export TP_SOCKET_IFNAME=$NIC_NAME
+    export HCCL_SOCKET_IFNAME=$NIC_NAME
+    export HCCL_INTRA_ROCE_ENABLE=1
+
+elif [ "$HARDWARE_SERIES" == "A3" ] && [ "$LINK_TYPE" == "HCCS" ]; then
+    export ACL_OP_INIT_MODE=1
+    export ASCEND_ENABLE_USE_FABRIC_MEM=1
+elif [ "$HARDWARE_SERIES" == "A5" ]; then
+    # A5 UBOE
+    export ASCEND_GLOBAL_RESOURCE_CONFIG='{"comm_resource_config.protocol_desc":["uboe:device"]}'
+    # A5 UB
+    export ASCEND_LOCAL_COMM_RES='{"version":"1.3"}'
+else
+    echo "Error: Invalid HARDWARE_SERIES. Set to 'A2', 'A3', or 'A5'."
+    exit 1
+fi
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+KV_CONFIG='{
+  "kv_connector": "AscendStoreConnector",
+  "kv_role": "kv_both",
+  "kv_connector_extra_config": {
+     "backend": "mooncake",
+     "lookup_rpc_port": "0"
+     }
+}'
+
+CMD_ARGS=(
+  --model "$MODEL_PATH"
+  --served-model-name "$SERVED_MODEL_NAME"
+  --trust-remote-code
+  --enforce-eager
+  --data-parallel-size "$DATA_PARALLEL_SIZE"
+  --tensor-parallel-size "$TENSOR_PARALLEL_SIZE"
+  --port 8100
+  --max-num-seqs 20
+  --max-model-len 32768
+  --max-num-batched-tokens 16384
+  --gpu-memory-utilization 0.9
+  --kv-transfer-config "$KV_CONFIG"
+)
+
+python -m vllm.entrypoints.openai.api_server "${CMD_ARGS[@]}" > log_mix.log 2>&1
+
+echo "vLLM started. Log file: log_mix.log"
+```
+
+Run inference (no separate proxy needed — requests go directly to the mixed deployment port):
+
+Short question:
+
+```shell
+curl -s http://localhost:8100/v1/completions -H "Content-Type: application/json" -d '{ "model": "qwen3", "prompt": "Hello. I have a question. The president of the United States is", "max_completion_tokens": 200, "temperature":0.0 }'
+```
+
+Long question:
+
+```shell
+curl -s http://localhost:8100/v1/completions -H "Content-Type: application/json" -d '{ "model": "qwen3", "prompt": "Given the accelerating impacts of climate change\u2014including rising sea levels, increasing frequency of extreme weather events, loss of biodiversity, and adverse effects on agriculture and human health\u2014there is an urgent need for a robust, globally coordinated response. However, international efforts are complicated by a range of factors: economic disparities between high-income and low-income countries, differing levels of industrialization, varying access to clean energy technologies, and divergent political systems that influence climate policy implementation. In this context, how can global agreements like the Paris Accord be redesigned or strengthened to not only encourage but effectively enforce emission reduction targets? Furthermore, what mechanisms can be introduced to promote fair and transparent technology transfer, provide adequate financial support for climate adaptation in vulnerable regions, and hold nations accountable without exacerbating existing geopolitical tensions or disproportionately burdening those with historically lower emissions?", "max_completion_tokens": 256, "temperature":0.0 }'
+```
+
+Expected output: Returns a JSON response in OpenAI Completions API format.
+
+**Note:** For MooncakeStore with `ASCEND_BUFFER_POOL` enabled, it is recommended to perform a warm-up phase before running actual performance benchmarks. Because HCCS one-sided communication connections are created lazily after instance launch, full-mesh connections require a one-time overhead (4 MB device memory per connection). Warm-up recommendation: input sequence length 8k, output sequence length 1, total requests 2-3x the number of devices.
+
+```shell
+# Example warm-up request
+curl -s http://localhost:8100/v1/completions -H "Content-Type: application/json" -d '{ "model": "qwen3", "prompt": "Hello.", "max_completion_tokens": 1, "temperature":0.0 }'
+```
+
+##### Step 5: MooncakeStore SSD Offload (Embedded Real Client Mode)
+
+In Mode A (Embedded Real Client), Mooncake is embedded in vLLM. When vLLM starts, `AscendStoreConnector`/`MooncakeBackend` automatically calls `MooncakeDistributedStore.setup()` using the settings in `mooncake.json`, with no separate `mooncake_client` process required.
+
+SSD disk usage control environment variables:
+
+```shell
+# 800 GB total disk, 8 TP ranks, ~100 GB per rank
+export MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=$((100 * 1024 * 1024 * 1024))
+export MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE=$((100 * 1024 * 1024 * 1024))
+export MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY=lru
+export MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=1073741824   # 1 GB
+```
+
+`MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` risk: If not aligned to 1 GB (A3 + FabricMem scenario), it may cause `adxl MallocMem` failures or `FileStorage init` segfaults. Always set to a multiple of 1 GB.
+
+#### Scenario 2: Memcache Backend
+
+##### Step 1: Prerequisite Checks
+
+**Check memory:**
+
+```shell
+free -h
+# If cache affects KV cache pool size:
+echo 3 > /proc/sys/vm/drop_caches
+echo 1 > /proc/sys/vm/compact_memory
+```
+
+**A3 only: scan available memory:**
+
+```shell
+python3 mem_scan.py                   # 1GB specification scan
+python3 mem_scan.py -m 2              # 2MB huge page scan
+```
+
+Script location: [mem_scan.py](https://gitcode.com/Ascend/memfabric_hybrid/blob/develop/script/mem_scan.py)
+
+**Ascend 950 Products only (disable signature verification + mount key paths + install kernel package):**
+
+```shell
+# Step 1: Disable HDK signature verification (only needs to be executed once per machine)
+for i in {0..7}; do npu-smi set -t custom-op-secverify-enable -i $i -d 1; done;
+for i in {0..7}; do npu-smi set -t custom-op-secverify-mode -i $i -d 0; done;
+```
+
+Docker containers need to mount key paths. Example command:
+
+```shell
+docker run -u root -it -d --name ${NAME} --net=host --privileged=true \
+    --device=/dev/davinci_manager --device=/dev/hisi_hdc --device=/dev/ummu --device=/dev/uburma \
+    --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
+    --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
+    -v /usr/bin/urma_admin:/usr/bin/urma_admin \
+    -v /lib/route.conf:/lib/route.conf \
+    -v /etc/hccl_rootinfo.json:/etc/hccl_rootinfo.json \
+    -v /usr/local/sbin/npu-smi:/usr/local/sbin/npu-smi \
+    -v /usr/local/sbin:/usr/local/sbin \
+    -v /usr/local/dcmi:/usr/local/dcmi \
+    -v /var/log/npu/:/usr/slog \
+    -v /etc/hccn.conf:/etc/hccn.conf \
+    -v /etc/hixlep:/etc/hixlep \
+    -v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    -w /home \
+    ${IMAGES_ID} \
+    bash
+```
+
+Update `/lib/route.conf` inside the container.
+
+**Check disk status before enabling SSD:**
+
+```shell
+lsblk /dev/nvme1n1                    # No partitions expected
+mount | grep nvme1n1                  # No mount points expected
+blkid /dev/nvme1n1                    # No filesystem signature expected
+```
+
+If no physical disk is available, simulate using a loop device:
+
+```shell
+dd if=/dev/zero of=/data/boostio_disk.img bs=1G count=640 status=progress
+LOOP_DEV=$(losetup --find --show --direct-io=on /data/boostio_disk.img)
+echo "${LOOP_DEV}"
+```
+
+##### Step 2: Software Installation
+
+```shell
+pip install memfabric-hybrid
+pip install memcache-hybrid
+```
+
+Enabling Memcache SSD Cache requires `memcache_hybrid >= 1.2.0`.
+
+##### Step 3: Configure Memcache Config File
+
+Find the installation path:
+
+```shell
+pip show memcache_hybrid
+```
+
+Use `{INSTALL_PATH}` to denote the `Location` value in the output.
+
+**mmc-meta.conf:**
+
+```ini
+ock.mmc.meta_service_url = tcp://xx.xx.xx.xx:5000
+ock.mmc.meta_service.config_store_url = tcp://xx.xx.xx.xx:6000
+ock.mmc.meta_service.metrics_url = http://xx.xx.xx.xx:8000
+ock.mmc.log_level = info
+# Tune the following parameters when SSD is enabled to improve SSD cache hit rate
+ock.mmc.evict_threshold_high = 70
+ock.mmc.evict_threshold_low = 60
+ock.mmc.rewarm.dram_watermark = 95
+```
+
+**mmc-local.conf:**
+
+```ini
+ock.mmc.meta_service_url = tcp://xx.xx.xx.xx:5000
+ock.mmc.local_service.config_store_url = tcp://xx.xx.xx.xx:6000
+ock.mmc.log_level = info
+ock.mmc.local_service.world_size = 256
+ock.mmc.local_service.protocol = device_sdma
+ock.mmc.local_service.dram.size = 1GB
+ock.mmc.local_service.max.dram.size = 1024GB
+# SSD feature related parameters below
+ock.mmc.local_service.storage.enabled = false
+ubsio.disk.path = /dev/nvmexn1:/dev/nvmexn2p1:/dev/loopX
+ubsio.mem.size_in_gb = 10
+ubsio.standalone.device_count = 8
+ubsio.standalone.force_new_disk = true
+```
+
+##### Step 4: Run MetaService
+
+```shell
+export MMC_META_CONFIG_PATH={INSTALL_PATH}/memcache_hybrid/config/mmc-meta.conf
+
+python -c "from memcache_hybrid import MetaService; MetaService.main()"
+```
+
+Expected output: MetaService starts successfully with no errors.
+
+##### Step 5: PD Disaggregation Scenario
+
+**run_prefill.sh / run_decode.sh:**
+
+```shell
+#!/bin/bash
+
+# prefill / decode
+ROLE="prefill"
+# A2 (800I/800T A2) or A3 (800I/800T A3) or A5 (950PR/950DT)
+HARDWARE_SERIES="A2"
+# Link type: ROCE or HCCS in A3 series.
+LINK_TYPE="ROCE"
+LOCAL_IP="xx.xx.xx.xx"
+NIC_NAME="xxxxxx"
+
+MODEL_PATH="xxxxxxx/Qwen3-32B"
+SERVED_MODEL_NAME="qwen3"
+DATA_PARALLEL_SIZE=1
+TENSOR_PARALLEL_SIZE=8
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+# parameters required for kv pool and memcache
+export PYTHONHASHSEED=0
+export MMC_LOCAL_CONFIG_PATH={INSTALL_PATH}/memcache_hybrid/config/mmc-local.conf
+export LD_LIBRARY_PATH={INSTALL_PATH}/memcache_hybrid/lib:${PYTHON_LIB_DIR}:${LD_LIBRARY_PATH}
+
+if [ "$ROLE" == "prefill" ]; then
+    KV_ROLE="kv_producer"
+    KV_PORT="20001"
+    LOOKUP_RPC_PORT="0"
+    API_PORT="8100"
+else
+    KV_ROLE="kv_consumer"
+    KV_PORT="20002"
+    LOOKUP_RPC_PORT="1"
+    API_PORT="8200"
+fi
+
+echo "Starting vLLM on Series: $HARDWARE_SERIES, Role: $ROLE"
+
+rm -rf /root/ascend/log/*
+rm -rf ./connector.log
+
+# See Configuration Parameters section for detailed parameter descriptions
+if [ "$HARDWARE_SERIES" == "A2" ] || { [ "$HARDWARE_SERIES" == "A3" ] && [ "$LINK_TYPE" == "ROCE" ]; }; then
+    echo 200000 > /proc/sys/vm/nr_hugepages
+    export HCCL_IF_IP=$LOCAL_IP
+    export GLOO_SOCKET_IFNAME=$NIC_NAME
+    export TP_SOCKET_IFNAME=$NIC_NAME
+    export HCCL_SOCKET_IFNAME=$NIC_NAME
+    export HCCL_INTRA_ROCE_ENABLE=1
+
+elif [ "$HARDWARE_SERIES" == "A3" ] && [ "$LINK_TYPE" == "HCCS" ]; then
+    export ACL_OP_INIT_MODE=1
+    export ASCEND_ENABLE_USE_FABRIC_MEM=1
+elif [ "$HARDWARE_SERIES" == "A5" ]; then
+    # A5 UBOE
+    export ASCEND_GLOBAL_RESOURCE_CONFIG='{"comm_resource_config.protocol_desc":["uboe:device"]}'
+    # A5 UB
+    export ASCEND_LOCAL_COMM_RES='{"version":"1.3"}'
+else
+    echo "Error: Invalid HARDWARE_SERIES. Set to 'A2', 'A3', or 'A5'."
+    exit 1
+fi
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+KV_CONFIG='{
+  "kv_connector": "MultiConnector",
+  "kv_role": "'$KV_ROLE'",
+  "kv_connector_extra_config": {
+    "connectors": [
+      {
+        "kv_connector": "MooncakeConnectorV1",
+        "kv_role": "'$KV_ROLE'",
+        "kv_port": "'$KV_PORT'",
+        "kv_connector_extra_config": {
+          "prefill": {
+            "dp_size": '$DATA_PARALLEL_SIZE',
+            "tp_size": '$TENSOR_PARALLEL_SIZE'
+          },
+          "decode": {
+            "dp_size": '$DATA_PARALLEL_SIZE',
+            "tp_size": '$TENSOR_PARALLEL_SIZE'
+          }
+        }
+      },
+      {
+        "kv_connector": "AscendStoreConnector",
+        "kv_role": "'$KV_ROLE'",
+        "kv_connector_extra_config": {
+          "backend": "memcache",
+          "lookup_rpc_port": "'$LOOKUP_RPC_PORT'",
+          "use_layerwise": false
+        }
+      }
+    ]
+  }
+}'
+
+CMD_ARGS=(
+  --model "$MODEL_PATH"
+  --served-model-name "$SERVED_MODEL_NAME"
+  --trust-remote-code
+  --enforce-eager
+  --data-parallel-size "$DATA_PARALLEL_SIZE"
+  --tensor-parallel-size "$TENSOR_PARALLEL_SIZE"
+  --port "$API_PORT"
+  --max-num-seqs 20
+  --max-model-len 32768
+  --max-num-batched-tokens 16384
+  --gpu-memory-utilization 0.9
+  --kv-transfer-config "$KV_CONFIG"
+)
+
+python -m vllm.entrypoints.openai.api_server "${CMD_ARGS[@]}" > log_${ROLE}.log 2>&1
+
+echo "vLLM started. Log file: log_${ROLE}.log"
+```
+
+`use_layerwise` can be set to `true` only on the Prefill node to enable per-layer KV access, requiring Memcache backend support. `consumer_is_to_put` and `consumer_is_to_load` can also be configured via `kv_connector_extra_config`.
+
+To start proxy_server and run inference, refer to the corresponding sub-steps in "Scenario 1: Mooncake Backend Step 3: PD Disaggregation Scenario".
+
+Expected output: Same as Mooncake scenario, returns OpenAI Completions API JSON response.
+
+##### Step 6: PD-Mixed Scenario
+
+**pd_mix.sh:**
+
+```shell
+#!/bin/bash
+
+# A2 (800I/800T A2) or A3 (800I/800T A3) or A5 (950PR/950DT)
+HARDWARE_SERIES="A2"
+# Link type: ROCE or HCCS in A3 series.
+LINK_TYPE="ROCE"
+LOCAL_IP="xx.xx.xx.xx"
+NIC_NAME="xxxxxx"
+
+MODEL_PATH="xxxxxxx/Qwen3-32B"
+SERVED_MODEL_NAME="qwen3"
+DATA_PARALLEL_SIZE=1
+TENSOR_PARALLEL_SIZE=8
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+
+# parameters required for kv pool and memcache
+export PYTHONHASHSEED=0
+export MMC_LOCAL_CONFIG_PATH={INSTALL_PATH}/memcache_hybrid/config/mmc-local.conf
+export LD_LIBRARY_PATH={INSTALL_PATH}/memcache_hybrid/lib:${PYTHON_LIB_DIR}:${LD_LIBRARY_PATH}
+
+echo "Starting vLLM on Series: $HARDWARE_SERIES"
+
+rm -rf /root/ascend/log/*
+rm -rf ./connector.log
+
+# See Configuration Parameters section for detailed parameter descriptions
+if [ "$HARDWARE_SERIES" == "A2" ] || { [ "$HARDWARE_SERIES" == "A3" ] && [ "$LINK_TYPE" == "ROCE" ]; }; then
+    echo 200000 > /proc/sys/vm/nr_hugepages
+    export HCCL_IF_IP=$LOCAL_IP
+    export GLOO_SOCKET_IFNAME=$NIC_NAME
+    export TP_SOCKET_IFNAME=$NIC_NAME
+    export HCCL_SOCKET_IFNAME=$NIC_NAME
+    export HCCL_INTRA_ROCE_ENABLE=1
+
+elif [ "$HARDWARE_SERIES" == "A3" ] && [ "$LINK_TYPE" == "HCCS" ]; then
+    export ACL_OP_INIT_MODE=1
+    export ASCEND_ENABLE_USE_FABRIC_MEM=1
+elif [ "$HARDWARE_SERIES" == "A5" ]; then
+    # A5 UBOE
+    export ASCEND_GLOBAL_RESOURCE_CONFIG='{"comm_resource_config.protocol_desc":["uboe:device"]}'
+    # A5 UB
+    export ASCEND_LOCAL_COMM_RES='{"version":"1.3"}'
+else
+    echo "Error: Invalid HARDWARE_SERIES. Set to 'A2', 'A3', or 'A5'."
+    exit 1
+fi
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+KV_CONFIG='{
+  "kv_connector": "AscendStoreConnector",
+  "kv_role": "kv_both",
+  "kv_connector_extra_config": {
+     "backend": "memcache",
+     "lookup_rpc_port": "0",
+     "use_layerwise": false
+  }
+}'
+
+CMD_ARGS=(
+  --model "$MODEL_PATH"
+  --served-model-name "$SERVED_MODEL_NAME"
+  --trust-remote-code
+  --enforce-eager
+  --data-parallel-size "$DATA_PARALLEL_SIZE"
+  --tensor-parallel-size "$TENSOR_PARALLEL_SIZE"
+  --port 8100
+  --max-num-seqs 20
+  --max-model-len 32768
+  --max-num-batched-tokens 16384
+  --gpu-memory-utilization 0.9
+  --kv-transfer-config "$KV_CONFIG"
+)
+
+python -m vllm.entrypoints.openai.api_server "${CMD_ARGS[@]}" > log_mix.log 2>&1
+
+echo "vLLM started. Log file: log_mix.log"
+```
+
+For inference commands, refer to the corresponding sub-steps in "Scenario 1: Mooncake Backend Step 4: PD-Mixed Scenario".
+
+##### Step 7: Memcache and vLLM Separated Deployment
+
+In separated deployment mode, Memcache runs in an independent process. This currently only supports the A3 HCCS scenario.
+
+Steps:
+
+1. Start MetaService (same as above).
+2. Use the following `mmc-local-standalone.conf` configuration to start an independent Memcache process on each node:
+
+   ```ini
+   ock.mmc.local_service.dram.size = 600GB
+   ock.mmc.local_service.max.dram.size = 1024GB
+   ```
+
+3. Wait for all nodes to report successful initialization.
+4. Use the following `mmc-local.conf` configuration (`dram.size = 0GB`) to start vLLM:
+
+   ```ini
+   ock.mmc.local_service.dram.size = 0GB
+   ock.mmc.local_service.max.dram.size = 1024GB
+   ```
+
+Startup script reference: [Memcache + vLLM + A3 Separated Deployment Case](https://gitcode.com/Ascend/memcache/wiki/MemCache+vLLM+A3%E5%88%86%E7%A6%BB%E9%83%A8%E7%BD%B2%E6%A1%88%E4%BE%8B.md)
+
+##### Step 8: Enable Memcache SSD Cache
+
+Enable SSD-related parameters in `mmc-local-standalone.conf` and adjust `ubsio.mem.size_in_gb` according to the UBS IO memory pool formula:
+
+```text
+maximum ubsio.mem.size_in_gb = min(3072, floor(available node memory for UBS IO (GB) / number of DRAM-enabled local services))
+```
+
+#### Scenario 3: Yuanrong Backend
+
+##### Step 1: Install Yuanrong Datasystem
+
+```bash
+pip install openyuanrong-datasystem
+python -c "import yr.datasystem; print('Yuanrong Datasystem is ready')"
+dscli --version
+```
+
+Expected output:
+- `Yuanrong Datasystem is ready`
+- Version number displayed by `dscli`.
+
+If the prebuilt package does not match the CANN or driver version, build Yuanrong Datasystem from source: [Yuanrong Datasystem](https://atomgit.com/openeuler/yuanrong-datasystem).
+
+##### Step 2: Choose a Service Discovery Backend
+
+**Option 1: Start Coordinator**
+
+```bash
+COORDINATOR_ADDRESS="<coordinator_ip>:31511"
+
+dscli start -c \
+  --coordinator_address "${COORDINATOR_ADDRESS}"
+```
+
+Expected output: `Start coordinator service ... success`.
+
+Single-node quick start (Coordinator + Worker in one step):
+
+```bash
+dscli start -a \
+  --coordinator_address "127.0.0.1:31511" \
+  --worker_address "127.0.0.1:31501" \
+  --shared_memory_size_mb 4096
+```
+
+**Option 2: Start etcd**
+
+```bash
+ETCD_VERSION="v3.5.12"
+ETCD_IP="127.0.0.1"
+if [ "$(uname -m)" = "aarch64" ]; then
+  ETCD_ARCH="linux-arm64"
+else
+  ETCD_ARCH="linux-amd64"
+fi
+wget https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-${ETCD_ARCH}.tar.gz
+tar -xvf etcd-${ETCD_VERSION}-${ETCD_ARCH}.tar.gz
+cd etcd-${ETCD_VERSION}-${ETCD_ARCH}
+sudo cp etcd etcdctl /usr/local/bin/
+
+etcd \
+  --name etcd-single \
+  --data-dir /tmp/etcd-data \
+  --listen-client-urls http://0.0.0.0:2379 \
+  --advertise-client-urls http://${ETCD_IP}:2379 \
+  --listen-peer-urls http://0.0.0.0:2380 \
+  --initial-advertise-peer-urls http://${ETCD_IP}:2380 \
+  --initial-cluster etcd-single=http://${ETCD_IP}:2380 &
+
+etcdctl --endpoints "${ETCD_IP}:2379" put key "value"
+etcdctl --endpoints "${ETCD_IP}:2379" get key
+```
+
+Expected output: `etcdctl put key "value"` returns `OK`; `etcdctl get key` returns `key`->`value`.
+
+##### Step 3: Start Datasystem Worker
+
+```bash
+COORDINATOR_ADDRESS="<coordinator_ip>:31511"
+WORKER_IP="<worker_ip>"
+WORKER_LOG_DIR="/var/log/yuanrong/worker"
+sudo mkdir -p "${WORKER_LOG_DIR}"
+sudo chown "$(id -u):$(id -g)" "${WORKER_LOG_DIR}"
+
+dscli start -w \
+  --worker_address "${WORKER_IP}:31501" \
+  --coordinator_address "${COORDINATOR_ADDRESS}" \
+  --log_dir "${WORKER_LOG_DIR}" \
+  --shared_memory_size_mb 40960 \
+  --arena_per_tenant 1 \
+  --enable_huge_tlb true \
+  --enable_fallocate false \
+  --rpc_thread_num 64 \
+  --oc_thread_num 64 \
+  --enable_worker_worker_batch_get true \
+  --sc_regular_socket_num 0 \
+  --sc_stream_socket_num 0
+```
+
+Expected output: Worker starts successfully with no errors, logs written to `--log_dir`.
+
+In multi-node deployments, each node runs one Worker with a unique reachable `worker_address`. All Workers must use the same service discovery backend and address.
+
+##### Step 4: Configure Environment Variables and `yuanrong.json`
+
+```bash
+export PYTHONHASHSEED=0
+export DS_WORKER_ADDR="${WORKER_IP}:31501"
+export DATASYSTEM_CLIENT_LOG_DIR="/var/log/yuanrong/client"
+export DS_ENABLE_EXCLUSIVE_CONNECTION=0
+export DS_ENABLE_REMOTE_H2D=0
+```
+
+Configure `yuanrong.json` (pointed to by `YR_CONFIG_PATH`):
+
+```json
+{
+    "worker_addr": "xx.xx.xx.xx:31501",
+    "connect_timeout_ms": 9000,
+    "request_timeout_ms": 0,
+    "get_sub_timeout_ms": 0,
+    "enable_remote_h2d": false,
+    "remote_h2d_transport_backend": "HIXL",
+    "enable_fabric_mem": false,
+    "enable_dev_mem_pregister": false,
+    "use_layerwise": false
+}
+```
+
+`worker_addr` must match the local `dscli start --worker_address` value.
+
+##### Step 5: Run AscendStoreConnector (Yuanrong Backend)
+
+```bash
+python3 -m vllm.entrypoints.openai.api_server \
+    --model /xxxxx/Qwen2.5-7B-Instruct \
+    --port 8100 \
+    --trust-remote-code \
+    --enforce-eager \
+    --no-enable-prefix-caching \
+    --tensor-parallel-size 1 \
+    --data-parallel-size 1 \
+    --max-model-len 10000 \
+    --block-size 128 \
+    --max-num-batched-tokens 4096 \
+    --kv-transfer-config \
+    '{
+    "kv_connector": "AscendStoreConnector",
+    "kv_role": "kv_both",
+    "kv_load_failure_policy": "recompute",
+    "kv_connector_extra_config": {
+        "lookup_rpc_port": "1",
+        "backend": "yuanrong",
+        "use_layerwise": false
+    }
+}'
+```
+
+`lookup_rpc_port` is the RPC port used between the pooling scheduler process and the worker process. Each instance must use a unique port value.
+
+**Note:** The Yuanrong backend normalizes KV keys before calling Datasystem. Supported ASCII keys up to 1024 bytes are preserved. Longer keys or keys containing unsupported characters are rewritten to a maximum of 1024 characters with a hash suffix, so do not rely on the raw key string when debugging backend storage. No extra buffer pre-registration step is required.
+
+Expected output: vLLM starts successfully, OpenAI API service is ready.
+
+### Verification (Required)
+
+**This content needs to be supplemented. The following content is inferred based on the original context, please confirm manually.**
+
+| Verification Item | Command | Expected Output |
+| :--- | :--- | :--- |
+| vLLM inference service | `curl -s http://localhost:<port>/v1/completions ...` | Returns JSON response with `choices` field, `finish_reason` is `stop` or `length` |
+| Yuanrong Datasystem ready | `python -c "import yr.datasystem; print('Yuanrong Datasystem is ready')"` | Prints `Yuanrong Datasystem is ready` |
+| dscli availability | `dscli --version` | Displays version number |
+| Coordinator startup | `dscli start -c ...` | Prints `Start coordinator service ... success` |
+| etcd availability | `etcdctl put key "value"; etcdctl get key` | put returns `OK`, get returns `key`->`value` |
+| Worker logs | Check logs under `--log_dir` | No errors/abnormal exits |
+| vLLM startup logs | `cat log_<role>.log` | Contains `Available KV cache memory` etc., no stack traces |
+| SSD Offload buffer | Startup logs | Each rank prints `AlignedClientBufferAllocator: allocated <N> bytes` |
+| Mooncake master | `curl -s http://<master_host>:9003/api/v1/tenant_quotas` | Returns tenant quota JSON |
+
+## Configuration Parameters (Required)
+
+**Reorganized based on the original context, please verify manually.**
+
+### kv-transfer-config Common Parameters
+
+| Parameter | Type | Default | Required | Value Range | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| kv_load_failure_policy | Content missing, needs manual completion. | fail | No | Content missing, needs manual completion. | Behavior when KV loading fails: `recompute` rolls back and recomputes (does not yet support hybrid attention models like DeepSeekV4, Qwen 3.5), `fail` terminates the request. When using MultiConnector, configure on the top-level `kv-transfer-config`. |
+| lookup_rpc_port | Content missing, needs manual completion. | Content missing, needs manual completion. | Content missing, needs manual completion. | Content missing, needs manual completion. | RPC port between pooling scheduler and worker processes. Each instance must use a unique port. |
+| load_async | Content missing, needs manual completion. | false | Content missing, needs manual completion. | Content missing, needs manual completion. | Whether to enable asynchronous loading. |
+| backend | Content missing, needs manual completion. | mooncake | Content missing, needs manual completion. | mooncake / memcache / yuanrong | KV Pool storage backend. |
+| consumer_is_to_put | Content missing, needs manual completion. | false | Content missing, needs manual completion. | Content missing, needs manual completion. | Whether Decode node puts KV Cache into KV Pool. |
+| consumer_is_to_load | Content missing, needs manual completion. | false | Content missing, needs manual completion. | Content missing, needs manual completion. | Whether Decode node loads KV Cache from KV Pool. |
+| use_layerwise | Content missing, needs manual completion. | false | Content missing, needs manual completion. | Content missing, needs manual completion. | Layer-by-layer KV save/load. Only supported on Prefill node with Memcache backend. |
+| prefill_pp_size | Content missing, needs manual completion. | Content missing, needs manual completion. | Required when Prefill enables PP | Content missing, needs manual completion. | Prefill PP size. |
+| prefill_pp_layer_partition | Content missing, needs manual completion. | Content missing, needs manual completion. | Content missing, needs manual completion. | Content missing, needs manual completion. | Prefill PP layer partition. |
+| qos_priority | Content missing, needs manual completion. | 0 | No | [0, 4] (integer, larger = higher priority) | KV Pool transfer QoS priority. |
+
+### mooncake.json Parameters
+
+| Parameter | Type | Default | Required | Value Range | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| metadata_server | Content missing, needs manual completion. | Content missing, needs manual completion. | Yes | P2PHANDSHAKE | Configured as P2PHANDSHAKE. |
+| protocol | Content missing, needs manual completion. | Content missing, needs manual completion. | Yes | ascend | Must be set to `ascend` on NPU. |
+| device_name | Content missing, needs manual completion. | "" (empty string) | Content missing, needs manual completion. | Content missing, needs manual completion. | The ascend protocol does not use device names; leave empty. |
+| master_server_address | Content missing, needs manual completion. | Content missing, needs manual completion. | Yes | `<ip>:<port>` | Master service IP and port. Can be overridden by `MOONCAKE_MASTER` environment variable. |
+| global_segment_size | Content missing, needs manual completion. | Content missing, needs manual completion. | Yes | Must align to 1 GB (1024 MB / 1048576 KB / 1073741824 B) | Registered memory size per card to the KV Pool. Can be overridden by `MOONCAKE_GLOBAL_SEGMENT_SIZE` environment variable. |
+| preferred_segment | Content missing, needs manual completion. | false | Content missing, needs manual completion. | Content missing, needs manual completion. | Whether to prefer storing KV on the local segment. |
+| prefer_alloc_in_same_node | Content missing, needs manual completion. | true | Content missing, needs manual completion. | Content missing, needs manual completion. | Whether to prefer allocating KV on the same node. |
+| enable_ssd_offload | Content missing, needs manual completion. | false | Content missing, needs manual completion. | Content missing, needs manual completion. | Whether to enable SSD offload. Environment variables are not supported. |
+| ssd_offload_path | Content missing, needs manual completion. | Content missing, needs manual completion. | Required when enable_ssd_offload=true | Absolute path | Absolute path for SSD offload data storage. Directory must exist and be writable. Relative paths, symlinks, and paths containing `..` are rejected. |
+| tenant_id | Content missing, needs manual completion. | default | No | Content missing, needs manual completion. | Mooncake tenant namespace. Non-default tenants require Mooncake >= 0.3.12. |
+
+### mooncake_master Parameters
+
+| Parameter | Type | Default | Required | Value Range | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| port | Content missing, needs manual completion. | Content missing, needs manual completion. | Yes | Content missing, needs manual completion. | Master service listening port, must match the port in `master_server_address` in mooncake.json. |
+| eviction_high_watermark_ratio | Content missing, needs manual completion. | Content missing, needs manual completion. | No | Content missing, needs manual completion. | Watermark where Mooncake Store performs eviction. |
+| eviction_ratio | Content missing, needs manual completion. | Content missing, needs manual completion. | No | Content missing, needs manual completion. | Portion of stored objects to evict. |
+| default_kv_lease_ttl | Content missing, needs manual completion. | Content missing, needs manual completion. | No | Content missing, needs manual completion. | Default lease TTL for KV objects (milliseconds). Must be larger than `ASCEND_CONNECT_TIMEOUT` and `ASCEND_TRANSFER_TIMEOUT`. |
+| enable_offload | Content missing, needs manual completion. | Content missing, needs manual completion. | Required when SSD offload is enabled | Content missing, needs manual completion. | Set to true to enable SSD offload in master. |
+| client_ttl | Content missing, needs manual completion. | 10 | No | Content missing, needs manual completion. | Seconds a client stays alive after the last Ping. |
+| enable_multi_tenants | Content missing, needs manual completion. | false | No | Content missing, needs manual completion. | Enable strict multi-tenant mode. |
+| tenant_quota_connector_type | Content missing, needs manual completion. | Content missing, needs manual completion. | Required when multi-tenant is enabled | file / etcd | Tenant quota connector type. |
+| tenant_quota_connector_uri | Content missing, needs manual completion. | Content missing, needs manual completion. | Required when multi-tenant is enabled | Content missing, needs manual completion. | Tenant quota file path or etcd endpoints. |
+
+### Mooncake SSD Environment Variables
+
+| Parameter | Type | Default | Required | Value Range | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES | Content missing, needs manual completion. | 1342177280 (1280 MB) | No | Must align to 1 GB when A3 + `ASCEND_ENABLE_USE_FABRIC_MEM=1` | Per-rank SSD read/write buffer size (bytes). Not configurable in mooncake.json. Increase when `BUFFER_OVERFLOW` occurs. |
+| MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE | Content missing, needs manual completion. | 0 | No | Content missing, needs manual completion. | Eviction threshold (bytes). 0 means 90% of physical disk capacity. |
+| MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY | Content missing, needs manual completion. | none | No | none / fifo / lru | SSD eviction policy. |
+| MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES | Content missing, needs manual completion. | 2199023255552 (2 TB) | Strongly recommended to set explicitly | Must match actual disk capacity | Per-rank maximum disk usage reported to Mooncake master. Default far exceeds real disk capacity; must be overridden. |
+
+### Memcache Configuration Parameters
+
+**mmc-meta.conf:**
+
+| Parameter | Type | Default | Required | Value Range | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| ock.mmc.meta_service_url | Content missing, needs manual completion. | Content missing, needs manual completion. | Yes | tcp://<ip>:<port> | MetaService address. P and D nodes must use the same endpoint. |
+| ock.mmc.meta_service.config_store_url | Content missing, needs manual completion. | Content missing, needs manual completion. | Yes | tcp://<ip>:<port> | Config store URL. |
+| ock.mmc.meta_service.metrics_url | Content missing, needs manual completion. | Content missing, needs manual completion. | No | http://<ip>:<port> | Metrics URL. |
+| ock.mmc.log_level | Content missing, needs manual completion. | info | No | Content missing, needs manual completion. | Log level. |
+| ock.mmc.evict_threshold_high | Content missing, needs manual completion. | Content missing, needs manual completion. | No | Content missing, needs manual completion. | High watermark threshold for SSD cache hit rate improvement. |
+| ock.mmc.evict_threshold_low | Content missing, needs manual completion. | Content missing, needs manual completion. | No | Content missing, needs manual completion. | Low watermark threshold for SSD cache hit rate improvement. |
+| ock.mmc.rewarm.dram_watermark | Content missing, needs manual completion. | Content missing, needs manual completion. | No | Content missing, needs manual completion. | DRAM watermark when SSD is enabled. |
+
+**mmc-local.conf:**
+
+| Parameter | Type | Default | Required | Value Range | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| ock.mmc.meta_service_url | Content missing, needs manual completion. | Content missing, needs manual completion. | Yes | tcp://<ip>:<port> | Must match mmc-meta.conf. |
+| ock.mmc.local_service.config_store_url | Content missing, needs manual completion. | Content missing, needs manual completion. | Yes | tcp://<ip>:<port> | Must match `ock.mmc.meta_service.config_store_url` in mmc-meta.conf. |
+| ock.mmc.local_service.world_size | Content missing, needs manual completion. | Content missing, needs manual completion. | Yes | Content missing, needs manual completion. | Maximum number of LocalServices supported (including future additions). |
+| ock.mmc.local_service.protocol | Content missing, needs manual completion. | Content missing, needs manual completion. | Yes | device_rdma / device_sdma / device_urma / device_uboe | Communication protocol. A2 recommended: `device_rdma` (RoCE); A3 HCCS recommended: `device_sdma`; A5 UB: `device_urma`; A5 UBOE: `device_uboe`. |
+| ock.mmc.local_service.dram.size | Content missing, needs manual completion. | Content missing, needs manual completion. | Yes | 0 or positive integer with unit (e.g., 1GB, 40GB) | DRAM size allocated per die. Set to 0GB for A3 HCCS. |
+| ock.mmc.local_service.max.dram.size | Content missing, needs manual completion. | Content missing, needs manual completion. | No | Content missing, needs manual completion. | Maximum DRAM size. Needed when ranks contribute different sizes. |
+| ock.mmc.local_service.storage.enabled | Content missing, needs manual completion. | false | No | Content missing, needs manual completion. | Enable SSD caching. |
+| ubsio.disk.path | Content missing, needs manual completion. | Content missing, needs manual completion. | Required when SSD is enabled | Absolute paths, multiple paths separated by `:` | SSD block device paths. Devices must be dedicated with no mount points or filesystem signatures. `/dev/sd*` not recommended. |
+| ubsio.mem.size_in_gb | Content missing, needs manual completion. | 10 | No | Integer [0, 3072]; SSD cache requires >= 5 | Per-process UBS IO memory pool size (GB). Separated deployment recommended: 50 GB. |
+| ubsio.standalone.device_count | Content missing, needs manual completion. | Content missing, needs manual completion. | Yes | Content missing, needs manual completion. | Number of LocalServices where `dram.size` is not 0. |
+| ubsio.standalone.force_new_disk | Content missing, needs manual completion. | Content missing, needs manual completion. | No | Content missing, needs manual completion. | Whether to initialize SSD as a new disk (current version does not support fault recovery; recommended true). |
+
+### Yuanrong dscli Worker Parameters
+
+| Parameter | Type | Default | Required | Value Range | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| worker_address | Content missing, needs manual completion. | Content missing, needs manual completion. | Yes | `<host>:<port>` | Worker address, must match `yuanrong.json` `worker_addr`. |
+| coordinator_address | Content missing, needs manual completion. | Content missing, needs manual completion. | Option 1 | `<ip>:31511` | Coordinator address. |
+| etcd_address | Content missing, needs manual completion. | Content missing, needs manual completion. | Option 2 | `<ip>:2379` | etcd address. |
+| log_dir | Content missing, needs manual completion. | Content missing, needs manual completion. | No | Content missing, needs manual completion. | Worker log directory, use absolute path. |
+| shared_memory_size_mb | Content missing, needs manual completion. | Content missing, needs manual completion. | Yes | Content missing, needs manual completion. | Shared memory size (MB). Example: 40960 (40 GB). |
+| arena_per_tenant | Content missing, needs manual completion. | Content missing, needs manual completion. | No | Content missing, needs manual completion. | Shared memory arena count per tenant. Conservative starting point: 1. |
+| enable_huge_tlb | Content missing, needs manual completion. | Content missing, needs manual completion. | No | Content missing, needs manual completion. | Use HugeTLB pages for shared memory. |
+| enable_fallocate | Content missing, needs manual completion. | Content missing, needs manual completion. | No | Content missing, needs manual completion. | Execute fallocate for shared memory file. Recommended false with HugeTLB. |
+| rpc_thread_num | Content missing, needs manual completion. | Content missing, needs manual completion. | No | Content missing, needs manual completion. | RPC/ZMQ service concurrency. |
+| oc_thread_num | Content missing, needs manual completion. | Content missing, needs manual completion. | No | Content missing, needs manual completion. | Object Cache business thread pool size. |
+| enable_worker_worker_batch_get | Content missing, needs manual completion. | Content missing, needs manual completion. | No | Content missing, needs manual completion. | Enable batched Object Cache reads between Workers. |
+| sc_regular_socket_num | Content missing, needs manual completion. | 0 | No | >= 0 | Stream Cache regular socket count. Keep at 0 when KV Pool does not use Stream Cache. |
+| sc_stream_socket_num | Content missing, needs manual completion. | 0 | No | >= 0 | Stream Cache stream socket count. Keep at 0 when KV Pool does not use Stream Cache. |
+| remote_h2d_device_ids | Content missing, needs manual completion. | empty | No | Comma-separated device IDs, e.g., `"0,1,2,3,4,5,6,7"` | Non-empty enables worker-side Remote H2D. |
+| remote_h2d_link_type | Content missing, needs manual completion. | ROCE | No | ROCE / HCCS (case-sensitive) | Link type. `ROCE` maps to client `P2P_TRANSFER`; `HCCS` maps to client `HIXL`. |
+| remote_h2d_hccs_buffer_pool | Content missing, needs manual completion. | 4:8 | No | `<count>:<size>` | HIXL buffer-pool parameter, only used when `link_type=HCCS`. |
+
+### Yuanrong Environment Variables
+
+| Variable | Type | Default | Required | Value Range | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| PYTHONHASHSEED | Content missing, needs manual completion. | 0 | Yes | Content missing, needs manual completion. | Must be consistent across all nodes to guarantee uniform hash generation. |
+| DS_WORKER_ADDR | Content missing, needs manual completion. | N/A | Yes | `<host>:<port>` | Datasystem Worker address, must match local `dscli start --worker_address` value. |
+| DATASYSTEM_CLIENT_LOG_DIR | Content missing, needs manual completion. | ~/.datasystem/logs | No | Content missing, needs manual completion. | Directory for Yuanrong client SDK logs. |
+| DS_ENABLE_EXCLUSIVE_CONNECTION | Content missing, needs manual completion. | 0 | No | Content missing, needs manual completion. | Set to 1 to enable exclusive connection mode. |
+| DS_ENABLE_REMOTE_H2D | Content missing, needs manual completion. | 0 | No | Content missing, needs manual completion. | Set to 1 to enable Remote H2D (requires Remote H2D prerequisites). |
+
+### yuanrong.json Fields
+
+| Field | Type | Default | Required | Value Range | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| worker_addr | Content missing, needs manual completion. | Content missing, needs manual completion. | Yes | `<host>:<port>` | Datasystem Worker address, must match `dscli start --worker_address`. |
+| connect_timeout_ms | Content missing, needs manual completion. | 9000 | Content missing, needs manual completion. | Integer >= 500 | Connection establishment timeout (ms). |
+| request_timeout_ms | Content missing, needs manual completion. | 0 | Content missing, needs manual completion. | Content missing, needs manual completion. | Request timeout (ms). 0 uses `connect_timeout_ms`. |
+| get_sub_timeout_ms | Content missing, needs manual completion. | 0 | Content missing, needs manual completion. | Content missing, needs manual completion. | Timeout for `mget_h2d_from_multi_buffers` to wait for objects to become ready (ms). |
+| enable_remote_h2d | Content missing, needs manual completion. | false | Content missing, needs manual completion. | Content missing, needs manual completion. | Passed to `HeteroClient.enable_remote_h2d`. |
+| remote_h2d_transport_backend | Content missing, needs manual completion. | HIXL | Content missing, needs manual completion. | HIXL / P2P_TRANSFER | vLLM-side transport name, corresponds to Worker `--remote_h2d_link_type` (HCCS ↔ HIXL, ROCE ↔ P2P_TRANSFER). |
+| enable_fabric_mem | Content missing, needs manual completion. | false | Content missing, needs manual completion. | Content missing, needs manual completion. | Selects HIXL FabricMem mode. Only meaningful when `remote_h2d_transport_backend=HIXL`. |
+| enable_dev_mem_pregister | Content missing, needs manual completion. | false | Content missing, needs manual completion. | Content missing, needs manual completion. | Master toggle for client-side device memory pre-registration. Takes effect only with `enable_remote_h2d=true`, `remote_h2d_transport_backend=HIXL`, and `enable_fabric_mem=false`. |
+| use_layerwise | Content missing, needs manual completion. | false | Content missing, needs manual completion. | Content missing, needs manual completion. | Must match `kv_connector_extra_config.use_layerwise`. |
+
+### ASCEND_GLOBAL_RESOURCE_CONFIG Fields
+
+| Field | Type | Default | Required | Value Range | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| comm_resource_config.protocol_desc | Content missing, needs manual completion. | Content missing, needs manual completion. | No | e.g., `["hccs:device"]`, `["roce:device"]`, `["uboe:device"]` | Protocol descriptor for MooncakeConnectorV1 PD transfer path. |
+| store.comm_resource_config.protocol_desc | Content missing, needs manual completion. | Content missing, needs manual completion. | No | e.g., `["roce:device"]` | Protocol descriptor for AscendStoreConnector Mooncake Store traffic. |
+| comm_resource_config.listen_port | Content missing, needs manual completion. | 16666 | No | Content missing, needs manual completion. | One-sided communication listen port. Use a different port for standalone `mooncake_client` processes. |
+| fabric_memory.max_capacity | Content missing, needs manual completion. | Content missing, needs manual completion. | Only when fabric mem budget is insufficient | Integer (GB per process) | Fabric memory quota. |
+
+### QoS Configuration
+
+| Parameter | Type | Default | Required | Value Range | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| qos_priority | Content missing, needs manual completion. | 0 | No | [0, 4] (integer, larger = higher priority) | Supported by both Mooncake and Memcache backends. Invalid values (non-integer, out of range) cause fast startup failure. |
+
+QoS can be configured through `kv_connector_extra_config`, which is injected into the backend-specific configuration automatically:
+
+```json
+{
+    "kv_connector": "AscendStoreConnector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+        "qos_priority": 1,
+        "lookup_rpc_port": "1",
+        "backend": "mooncake",
+        "use_layerwise": false
+    }
+}
+```
+
+Values in `kv_connector_extra_config` take precedence over environment variables; a WARN log is emitted on override.
+
+### Hardware-Specific Environment Variables
+
+| Variable | Type | Default | Required | Value Range | Description |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| ASCEND_GLOBAL_RESOURCE_CONFIG | Content missing, needs manual completion. | Content missing, needs manual completion. | Required for Ascend 950 Products UBOE | JSON string | UBOE protocol descriptor, e.g., `{"comm_resource_config.protocol_desc":["uboe:device"]}`. |
+| ASCEND_LOCAL_COMM_RES | Content missing, needs manual completion. | Content missing, needs manual completion. | Required for Ascend 950 Products UB | JSON string | e.g., `{"version":"1.3"}`. |
+| ASCEND_ENABLE_USE_FABRIC_MEM | Content missing, needs manual completion. | Content missing, needs manual completion. | Recommended for A3 HCCS | 1 / 0 | Enables unified memory address direct transfer. Recommended for A3 series. |
+| HCCL_INTRA_ROCE_ENABLE | Content missing, needs manual completion. | Content missing, needs manual completion. | Required for A2 ROCE | 1 / 0 | Required for A2 series ROCE direct transfer. |
+
+**Hardware Dependency Quick Reference:**
+
+| Hardware Series | HDK Requirement | CANN Requirement | Other Dependencies |
+| :--- | :--- | :--- | :--- |
+| 950PR/DT Ascend 950 Products | >= 25.6 (with mooncake >= v0.3.11) | >= 9.1.0 | Requires UBOE/UB device and config mounts |
+| 800 I/T A3 | >= 26.0 or >= 25.5 (with mooncake >= v0.3.11) | >= 9.0.0 | LingQu Computing Network >= 1.5; recommended `ASCEND_ENABLE_USE_FABRIC_MEM=1` |
+| 800 I/T A2 | >= 25.5 recommended | Content missing, needs manual completion. | `HCCL_INTRA_ROCE_ENABLE=1` direct transfer |
+
+## Tuning Recommendations (Optional)
+
+**Reorganized based on the original context, please verify manually.**
+
+### Mooncake SSD Offload Parameter Tuning
+
+- Increase `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` when `BUFFER_OVERFLOW` occurs, but do not exceed the `Available KV cache memory` value in vLLM Worker logs. Use byte literals only (e.g., `10737418240`); `10G`/`10GB` is not supported.
+- On A3 with `ASCEND_ENABLE_USE_FABRIC_MEM=1`, `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` must be aligned to 1 GB (multiple of 1073741824). The default 1280 MB is not aligned and may cause `adxl MallocMem` failures or `FileStorage init` segfaults.
+- Fabric mem budget formula (per rank):
+  ```text
+  fabric_memory.max_capacity >= global_segment_size + MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES (+ headroom)
+  ```
+  If quota is insufficient, some ranks may fail with `Memory_Allocation_Failure(EL0004)` after `global_segment_size` succeeds but `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` allocation fails.
+- `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` defaults to 2 TB which far exceeds real disk capacity. Always set it to the actual per-rank budget. For example, with 800 GB disk and 8 TP ranks:
+  ```shell
+  export MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=$((100 * 1024 * 1024 * 1024))
+  export MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE=$((100 * 1024 * 1024 * 1024))
+  export MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY=lru
+  export MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=1073741824   # 1 GB
+  ```
+- Host memory budget:
+  ```text
+  host_memory_for_mooncake ~ TP x (global_segment_size + MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES + local_buffer_size)
+  ```
+
+### MooncakeStore Warm-up
+
+For MooncakeStore with `ASCEND_BUFFER_POOL` enabled, perform a warm-up phase before running actual performance benchmarks. Since HCCS one-sided communication connections are created lazily after instance launch, full-mesh connections incur a one-time overhead (4 MB device memory per connection). Warm-up recommendation: input sequence length 8k, output sequence length 1, total requests 2-3x number of devices.
+
+### Memcache UBS IO Memory Pool Tuning
+
+- `ubsio.mem.size_in_gb` upper limit formula:
+  ```text
+  maximum ubsio.mem.size_in_gb = min(3072, floor(available node memory for UBS IO (GB) / number of DRAM-enabled local services))
+  ```
+- Separated deployment recommended: 50 GB per process; other scenarios: 10 GB.
+- To use L2.5 memory caching, increase `ubsio.mem.size_in_gb` within the limit and adjust [ubsio.wcache.evict_water_level](https://gitcode.com/Ascend/memcache/wiki/DRAM%20+%20SSD%20%E5%A4%9A%E7%BA%A7%E6%B1%A0%E5%8C%96%E9%85%8D%E7%BD%AE%E6%8C%87%E5%8D%97.md#ubsiowcacheevict_water_level).
+
+### Yuanrong Worker Parameter Tuning
+
+- Thread counts such as `rpc_thread_num` and `oc_thread_num` are tuning starting points. Adjust them according to available CPU cores and measured request throughput.
+- With `shared_memory_size_mb=40960`, reserve at least 20480 2 MiB huge pages:
+  ```bash
+  grep -E "HugePages_Total|HugePages_Free|Hugepagesize" /proc/meminfo
+  ```
+- Worker `-w` consumes subsequent command-line arguments. All `dscli start` options (e.g., `--timeout`) must be placed before `-w`.
+
+### QoS Priority
+
+- `qos_priority` range [0, 4] (integer), 0 is default. Larger value = higher priority.
+- Configured via `kv_connector_extra_config`. For Mooncake backend, `qos_priority` is merged into existing `ASCEND_GLOBAL_RESOURCE_CONFIG` (other fields preserved). When `ASCEND_GLOBAL_RESOURCE_CONFIG` is not set, configuring `qos_priority` also creates it.
+
+## FAQ (Optional)
+
+**Reorganized based on the original context, please verify manually.**
+
+Public FAQ references:
+- [Mooncake Store Deployment Guide](https://github.com/kvcache-ai/Mooncake/blob/main/docs/source/deployment/mooncake-store-deployment-guide.md)
+- [SSD Offload](https://github.com/kvcache-ai/Mooncake/blob/main/docs/source/deployment/ssd/ssd-offload.md)
+- [HIXL Common Issue Localization Guide](https://gitcode.com/cann/hixl/wiki/HIXL%E5%B8%B8%E8%A7%81%E9%97%AE%E9%A2%98%E5%AE%9A%E4%BD%8D%E6%89%8B%E5%86%8C.md)
+- [Memcache FAQ](https://gitcode.com/Ascend/memcache/wiki/FAQ.md)
+
+### Issue 1: failed to put/get key
+
+**Problem Description:** vLLM reports failed `put` or `get` operations.
+
+**Root Cause Analysis:** First determine whether the error is reported by Mooncake itself:
+- `put` failure: Mooncake log shows `NO_AVAILABLE_HANDLE` or `BatchPut failed ... due to insufficient space`. This usually means the remaining space after eviction is not enough for one `BatchPut` request.
+- `get` failure: Mooncake log shows `lease_expired_before_data_transfer_completed key=...` or returns `LEASE_EXPIRED`. The KV object lease expired before data transfer completed.
+
+**Resolution Steps:**
+1. Identify the error source. If Mooncake-reported `put` failure, ensure eviction policy remaining space (e.g., `1 - eviction_ratio`) can hold one batch put, or increase capacity, increase eviction headroom, or reduce batch size.
+2. If `get` failure, increase `mooncake_master` `--default_kv_lease_ttl` and keep it larger than `ASCEND_CONNECT_TIMEOUT` and `ASCEND_TRANSFER_TIMEOUT`.
+3. If not Mooncake-reported, it is likely an HIXL (ascend_direct) transfer-layer issue. Collect plog files under `/root/ascend/log/debug/plog` for investigation.
+
+### Issue 2: SEGMENT_NOT_FOUND (SSD Offload)
+
+**Problem Description:** Client logs show `OffloadObjectHeartbeat failed, error code is SEGMENT_NOT_FOUND`. The rank's SSD Offload stops until the segment is registered again.
+
+**Root Cause Analysis:** Master has unmounted the rank's `LOCAL_DISK` segment (typically after `client_expired` when Ping stops refreshing TTL). Common trigger when `enable_cpu_binding=true`: Mooncake starts Ping during init, then vLLM-Ascend `bind_cpus()` runs `migratepages`/IRQ binding; the Ping thread is not pinned and misses beats under default `client_ttl=10`.
+
+**Resolution Steps:**
+1. Temporary: raise Master TTL, e.g., `mooncake_master ... --client_ttl=120`. Tune to your init/warmup window (60-120 is often enough).
+2. Recovery: upgrade Mooncake to > v0.3.11 (main branch) which can remount `LOCAL_DISK` and rescan metadata.
+3. Root fix: pin the storage Ping thread to a release/isolated CPU (Mooncake-side change).
+4. When debugging restarts, restart Master together with vLLM to avoid stale `segment_already_exists` state.
+
+### Issue 3: Fabric Memory Misalignment Causing Allocation Failure
+
+**Problem Description:** `adxl MallocMem` / `aclrtMapMem` reports `Invalid_Argument`. With SSD offload enabled, `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` allocation failure may cause `FileStorage init` segfault and abort vLLM startup.
+
+**Root Cause Analysis:** On A3 with `ASCEND_ENABLE_USE_FABRIC_MEM=1`, each fabric mem allocation must be an integer multiple of 1 GB. Mooncake does not round sizes up. The default 1280 MB (1.25 GB) is not aligned.
+
+**Resolution Steps:**
+1. Set `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` to a 1 GB multiple, e.g., `1073741824` (1 GB).
+2. Configure fabric mem quota per formula: `fabric_memory.max_capacity >= global_segment_size + MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES (+ headroom)`, for example:
+   ```bash
+   export ASCEND_ENABLE_USE_FABRIC_MEM=1
+   export MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=1073741824   # 1 GB, fabric-mem aligned
+   export ASCEND_GLOBAL_RESOURCE_CONFIG='{"fabric_memory.max_capacity":32}'
+   ```
+3. Avoid unaligned values like `1280MB`, `512MB`, `1.5GB`. Note that `local_buffer_size` in `mooncake.json` is not used under fabric mem mode.
+
+### Issue 4: MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES Too Small (BUFFER_OVERFLOW)
+
+**Problem Description:** SSD reads fail with `BUFFER_OVERFLOW` (`error_code=-10`) during `FileStorage::AllocateBatch`, and vLLM may fail when `kv_load_failure_policy=fail`.
+
+**Root Cause Analysis:** With `enable_ssd_offload=true`, Mooncake allocates a separate per-rank SSD read/write buffer. This buffer is independent of `global_segment_size` in `mooncake.json` — increasing the segment does not fix `BUFFER_OVERFLOW`.
+
+**Resolution Steps:**
+1. Increase `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES`, but not higher than the `Available KV cache memory` value in vLLM Worker logs:
+   ```text
+   (Worker_TP0_EP0 pid=21240) INFO ... Available KV cache memory: XX
+   ```
+2. Example: `export MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES=10737418240` (10 GB).
+3. Use byte literals only; `10G`/`10GB` is ignored and falls back to the 1280 MB default.
+4. Verify after tuning: each rank prints `AlignedClientBufferAllocator: allocated <N> bytes` at startup; no `BUFFER_OVERFLOW` / `Failed to get ... keys out of ... error_codes=[-10]` under load.
+5. If failures persist with a large buffer, check overlapping loads (`load_async`).
+
+### Issue 5: Memcache Related Issues
+
+**Content missing, needs manual completion.** For Memcache troubleshooting, refer to the [Memcache FAQ](https://gitcode.com/Ascend/memcache/wiki/FAQ.md).
+
+### Issue 6: DSv4 Known Issue (Temporary)
+
+**Content missing, needs manual completion.** For the temporary DSv4 known issue, refer to [vllm-ascend issue #9975](https://github.com/vllm-project/vllm-ascend/issues/9975).
